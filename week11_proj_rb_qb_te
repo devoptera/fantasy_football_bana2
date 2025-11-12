@@ -1,0 +1,209 @@
+import pandas as pd
+import numpy as np
+import sqlite3
+from sklearn.linear_model import LinearRegression
+
+DB = r"C:/Users/cmice/repo/fantasy/fantasy.db"
+conn = sqlite3.connect(DB)
+
+# ---------- Helper ----------
+def _clean_rate(s, lo, hi, fallback):
+    s = s.replace([np.inf, -np.inf], np.nan)
+    s = s.fillna(fallback)
+    return s.clip(lo, hi)
+
+# ---------- Generic Regression Trainer ----------
+def train_model(position: str, features: list):
+    df = pd.read_sql(f"""
+        SELECT * FROM all_weeks_joined
+        WHERE position='{position}' AND week_num <= 9
+    """, conn)
+
+    X = df[features].fillna(0)
+    y = df["pts_ppr"]
+    m = LinearRegression().fit(X, y)
+    df["resid"] = y - m.predict(X)
+
+    # Save artifacts
+    pd.DataFrame({"feature": features, "coef": m.coef_}).to_sql(
+        f"{position.lower()}_model_coefs", conn, if_exists="replace", index=False
+    )
+    df[["playerID","week_num","resid"]].to_sql(
+        f"{position.lower()}_residuals", conn, if_exists="replace", index=False
+    )
+
+    print(f"\n--- {position} MODEL ---")
+    print("Intercept:", round(m.intercept_, 4))
+    print(pd.DataFrame({"feature": features, "coef": m.coef_}))
+    print("R²:", round(m.score(X, y), 4))
+    return m, df
+
+# ---------- RB ----------
+def run_rb(model, train_df):
+    rb_rates = (
+        train_df.groupby("playerID", as_index=False)
+        .agg(rush_att_sum=("rush_att","sum"),
+             rush_yd_sum=("rush_yd","sum"),
+             rush_td_sum=("rush_td","sum"),
+             rec_tgt_sum=("rec_tgt","sum"),
+             rec_sum=("rec","sum"),
+             rec_yd_sum=("rec_yd","sum"),
+             rec_td_sum=("rec_td","sum"))
+    )
+
+    pos_ypc      = (rb_rates["rush_yd_sum"].sum() / rb_rates["rush_att_sum"].sum()) if rb_rates["rush_att_sum"].sum() else 4.3
+    pos_rtd_rate = (rb_rates["rush_td_sum"].sum() / rb_rates["rush_att_sum"].sum()) if rb_rates["rush_att_sum"].sum() else 0.03
+    pos_cr       = (rb_rates["rec_sum"].sum() / rb_rates["rec_tgt_sum"].sum()) if rb_rates["rec_tgt_sum"].sum() else 0.67
+    pos_ypt      = (rb_rates["rec_yd_sum"].sum() / rb_rates["rec_tgt_sum"].sum()) if rb_rates["rec_tgt_sum"].sum() else 6.5
+    pos_rtd_tgt  = (rb_rates["rec_td_sum"].sum() / rb_rates["rec_tgt_sum"].sum()) if rb_rates["rec_tgt_sum"].sum() else 0.03
+
+    rb_rates["ypc"]        = _clean_rate(rb_rates["rush_yd_sum"] / rb_rates["rush_att_sum"], 3.0, 6.5, pos_ypc)
+    rb_rates["rush_tdr"]   = _clean_rate(rb_rates["rush_td_sum"] / rb_rates["rush_att_sum"], 0.00, 0.08, pos_rtd_rate)
+    rb_rates["catch_rate"] = _clean_rate(rb_rates["rec_sum"] / rb_rates["rec_tgt_sum"], 0.45, 0.9, pos_cr)
+    rb_rates["ypt"]        = _clean_rate(rb_rates["rec_yd_sum"] / rb_rates["rec_tgt_sum"], 3.5, 10.0, pos_ypt)
+    rb_rates["rec_tdr"]    = _clean_rate(rb_rates["rec_td_sum"] / rb_rates["rec_tgt_sum"], 0.00, 0.12, pos_rtd_tgt)
+
+    rb = pd.read_sql("SELECT * FROM week11_inputs WHERE position='RB'", conn)
+    rb = rb.rename(columns={
+        "rush_att_base":"rush_att",
+        "rec_tgt_base":"rec_tgt",
+        "off_snp_base":"off_snp",
+        "ease_base":"ease_factor"
+    })
+
+    rb = rb.merge(rb_rates[["playerID","ypc","rush_tdr","catch_rate","ypt","rec_tdr"]],
+                  on="playerID", how="left")
+
+    rb["rush_yd"] = rb["rush_att"].fillna(0) * rb["ypc"].fillna(pos_ypc)
+    rb["rush_td"] = rb["rush_att"].fillna(0) * rb["rush_tdr"].fillna(pos_rtd_rate)
+    rb["rec"]     = rb["rec_tgt"].fillna(0) * rb["catch_rate"].fillna(pos_cr)
+    rb["rec_yd"]  = rb["rec_tgt"].fillna(0) * rb["ypt"].fillna(pos_ypt)
+    rb["rec_td"]  = rb["rec_tgt"].fillna(0) * rb["rec_tdr"].fillna(pos_rtd_tgt)
+
+    features = ["rush_att","rush_yd","rush_td","rec_tgt","rec","rec_yd","rec_td","off_snp","ease_factor"]
+    rb["mu"] = model.predict(rb[features].fillna(0))
+
+    rb.to_sql("rb_week11_predictions", conn, if_exists="replace", index=False)
+    print("\nTop RB Week 11 Projections:")
+    print(rb[["playerName","team","opponent","mu"]].sort_values("mu", ascending=False).head(10))
+    return rb
+
+# ---------- TE ----------
+def run_te(model, train_df):
+    te_rates = (
+        train_df.groupby("playerID", as_index=False)
+        .agg(rec_tgt_sum=("rec_tgt","sum"),
+             rec_sum=("rec","sum"),
+             rec_yd_sum=("rec_yd","sum"),
+             rec_td_sum=("rec_td","sum"))
+    )
+
+    pos_cr  = (te_rates["rec_sum"].sum() / te_rates["rec_tgt_sum"].sum()) if te_rates["rec_tgt_sum"].sum() else 0.66
+    pos_ypt = (te_rates["rec_yd_sum"].sum() / te_rates["rec_tgt_sum"].sum()) if te_rates["rec_tgt_sum"].sum() else 7.2
+    pos_tdr = (te_rates["rec_td_sum"].sum() / te_rates["rec_tgt_sum"].sum()) if te_rates["rec_tgt_sum"].sum() else 0.05
+
+    te_rates["catch_rate"] = _clean_rate(te_rates["rec_sum"] / te_rates["rec_tgt_sum"], 0.4, 0.9, pos_cr)
+    te_rates["ypt"]        = _clean_rate(te_rates["rec_yd_sum"] / te_rates["rec_tgt_sum"], 4.0, 12.0, pos_ypt)
+    te_rates["td_rate"]    = _clean_rate(te_rates["rec_td_sum"] / te_rates["rec_tgt_sum"], 0.0, 0.15, pos_tdr)
+
+    te = pd.read_sql("SELECT * FROM week11_inputs WHERE position='TE'", conn)
+    te = te.rename(columns={"rec_tgt_base":"rec_tgt","off_snp_base":"off_snp","ease_base":"ease_factor"})
+    te = te.merge(te_rates[["playerID","catch_rate","ypt","td_rate"]], on="playerID", how="left")
+
+    te["rec"]    = te["rec_tgt"].fillna(0) * te["catch_rate"].fillna(pos_cr)
+    te["rec_yd"] = te["rec_tgt"].fillna(0) * te["ypt"].fillna(pos_ypt)
+    te["rec_td"] = te["rec_tgt"].fillna(0) * te["td_rate"].fillna(pos_tdr)
+
+    features = ["rec_tgt","rec","rec_yd","rec_td","off_snp","ease_factor"]
+    te["mu"] = model.predict(te[features].fillna(0))
+
+    te.to_sql("te_week11_predictions", conn, if_exists="replace", index=False)
+    print("\nTop TE Week 11 Projections:")
+    print(te[["playerName","team","opponent","mu"]].sort_values("mu", ascending=False).head(10))
+    return te
+
+# ---------- QB ----------
+def run_qb(model, train_df):
+    qb_rates = (
+        train_df.groupby("playerID", as_index=False)
+        .agg(att_sum=("pass_att","sum"),
+             cmp_sum=("pass_cmp","sum"),
+             yds_sum=("pass_yd","sum"),
+             td_sum=("pass_td","sum"),
+             int_sum=("pass_int","sum"),
+             r_att_sum=("rush_att","sum"),
+             r_yd_sum=("rush_yd","sum"),
+             r_td_sum=("rush_td","sum"))
+    )
+
+    # Fixed syntax block here
+    pos_cmp_rate = (qb_rates["cmp_sum"].sum() / qb_rates["att_sum"].sum()) if qb_rates["att_sum"].sum() else 0.64
+    pos_ypa      = (qb_rates["yds_sum"].sum() / qb_rates["att_sum"].sum()) if qb_rates["att_sum"].sum() else 7.2
+    pos_td_att   = (qb_rates["td_sum"].sum()  / qb_rates["att_sum"].sum()) if qb_rates["att_sum"].sum() else 0.045
+    pos_int_att  = (qb_rates["int_sum"].sum() / qb_rates["att_sum"].sum()) if qb_rates["att_sum"].sum() else 0.025
+    pos_rypc     = (qb_rates["r_yd_sum"].sum()/ qb_rates["r_att_sum"].sum()) if qb_rates["r_att_sum"].sum() else 4.5
+    pos_rtd_rush = (qb_rates["r_td_sum"].sum()/ qb_rates["r_att_sum"].sum()) if qb_rates["r_att_sum"].sum() else 0.05
+
+    qb_rates["cmp_rate"]   = _clean_rate(qb_rates["cmp_sum"] / qb_rates["att_sum"], 0.5, 0.75, pos_cmp_rate)
+    qb_rates["ypa"]        = _clean_rate(qb_rates["yds_sum"] / qb_rates["att_sum"], 5.5, 9.5,  pos_ypa)
+    qb_rates["td_per_att"] = _clean_rate(qb_rates["td_sum"] / qb_rates["att_sum"], 0.01,0.08, pos_td_att)
+    qb_rates["int_per_att"]= _clean_rate(qb_rates["int_sum"] / qb_rates["att_sum"], 0.00,0.06, pos_int_att)
+    qb_rates["rypc"]       = _clean_rate(qb_rates["r_yd_sum"] / qb_rates["r_att_sum"], 2.5, 7.5, pos_rypc)
+    qb_rates["rtd_rate"]   = _clean_rate(qb_rates["r_td_sum"] / qb_rates["r_att_sum"], 0.00,0.12, pos_rtd_rush)
+
+    qb = pd.read_sql("SELECT * FROM week11_inputs WHERE position='QB'", conn)
+    qb = qb.rename(columns={"rush_att_base":"rush_att","off_snp_base":"off_snp","ease_base":"ease_factor"})
+
+    qb = qb.merge(qb_rates[["playerID","cmp_rate","ypa","td_per_att","int_per_att","rypc","rtd_rate"]],
+                  on="playerID", how="left")
+
+    # Determine baseline pass attempts
+    # --- Safe baseline pass attempts ---
+    if "pass_att_base" in qb.columns:
+        qb["pass_att"] = qb["pass_att_base"].fillna(30)
+    elif "pass_att" in qb.columns:
+        qb["pass_att"] = qb["pass_att"].fillna(30)
+    else:
+        qb["pass_att"] = 30
+
+    # --- Calculate expected QB stats using player or position averages ---
+    qb["pass_cmp"] = qb["pass_att"] * qb["cmp_rate"].fillna(pos_cmp_rate)
+    qb["pass_yd"]  = qb["pass_att"] * qb["ypa"].fillna(pos_ypa)
+    qb["pass_td"]  = qb["pass_att"] * qb["td_per_att"].fillna(pos_td_att)
+    qb["pass_int"] = qb["pass_att"] * qb["int_per_att"].fillna(pos_int_att)
+
+    qb["rush_yd"]  = qb["rush_att"].fillna(0) * qb["rypc"].fillna(pos_rypc)
+    qb["rush_td"]  = qb["rush_att"].fillna(0) * qb["rtd_rate"].fillna(pos_rtd_rush)
+
+    # --- Feature set & prediction ---
+    features = [
+        "pass_att","pass_cmp","pass_yd","pass_td","pass_int",
+        "rush_att","rush_yd","rush_td","off_snp","ease_factor"
+    ]
+
+    qb["mu"] = model.predict(qb[features].fillna(0))
+
+    qb.to_sql("qb_week11_predictions", conn, if_exists="replace", index=False)
+
+    print("\nTop QB Week 11 Projections:")
+    print(qb[["playerName","team","opponent","mu"]]
+          .sort_values("mu", ascending=False)
+          .head(10))
+
+    return qb
+
+# ---------- RUN ALL ----------
+RB_features = ["rush_att","rush_yd","rush_td","rec_tgt","rec","rec_yd","rec_td","off_snp","ease_factor"]
+TE_features = ["rec_tgt","rec","rec_yd","rec_td","off_snp","ease_factor"]
+QB_features = ["pass_att","pass_cmp","pass_yd","pass_td","pass_int","rush_att","rush_yd","rush_td","off_snp","ease_factor"]
+
+rb_model, rb_train = train_model("RB", RB_features)
+rb_week11 = run_rb(rb_model, rb_train)
+
+te_model, te_train = train_model("TE", TE_features)
+te_week11 = run_te(te_model, te_train)
+
+qb_model, qb_train = train_model("QB", QB_features)
+qb_week11 = run_qb(qb_model, qb_train)
+
+conn.close()
